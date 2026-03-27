@@ -289,7 +289,16 @@ const CATEGORIES = {
     'https://www.aljazeera.com/economy/',
     'https://www.bbc.com/business',
     'https://www.nbcnews.com/business'
-  ]
+  ],
+  middleEast: [
+    'https://www.nytimes.com/section/world/middleeast?page=3',
+    'https://edition.cnn.com/world/middle-east',
+    'https://timesofindia.indiatimes.com/world/middle-east',
+    'https://www.theguardian.com/world/middleeast',
+    'https://www.aljazeera.com/middle-east/',
+    'https://www.bbc.com/news/world/middle_east',
+    'https://www.nbcnews.com/news/mideast'
+]
 };
 
 async function compileAllNews(urlsToScrape) {
