@@ -374,6 +374,141 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
+// ENDPOINT 3: Get ALL news across ALL categories for today
+app.get('/api/news/all', async (req, res) => {
+  try {
+    const today = new Date().toLocaleDateString('en-CA');
+    const allRecords = await NewsRecord.find({ date: today });
+
+    if (!allRecords || allRecords.length === 0) {
+      return res.status(404).json({ error: 'No data found for today. Run /api/sync-database first.' });
+    }
+
+    // Format the response so the frontend can easily map over it
+    const combinedData = {};
+    allRecords.forEach(record => {
+      combinedData[record.category] = record.data;
+    });
+
+    res.json(combinedData);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error fetching all news' });
+  }
+});
+
+// ENDPOINT 4: Get news by specific source (e.g., /api/news/source/NYT)
+app.get('/api/news/source/:siteKey', async (req, res) => {
+  try {
+    // Keep this for the response, but we'll use a safer check for the data
+    const requestedSite = req.params.siteKey.toUpperCase(); 
+    const today = new Date().toLocaleDateString('en-CA');
+    
+    const allRecords = await NewsRecord.find({ date: today });
+
+    // Quick debug: If this logs 0, your date string is the problem!
+    console.log(`Found ${allRecords.length} records for date: ${today}`);
+
+    let sourceArticles = { site: requestedSite, totalFound: 0, articles: [] };
+
+    allRecords.forEach(record => {
+      const categoryData = record.data;
+      
+      if (categoryData) {
+        // 1. Find the actual key in the object, ignoring case
+        const actualKey = Object.keys(categoryData).find(
+          key => key.toUpperCase() === requestedSite || key.toUpperCase().includes(requestedSite)
+        );
+
+        // 2. If we found a matching key, grab the data using THAT key
+        if (actualKey && categoryData[actualKey] && categoryData[actualKey].all) {
+          const articles = categoryData[actualKey].all;
+          
+          articles.forEach(article => {
+            sourceArticles.articles.push({ ...article, category: record.category });
+          });
+        }
+      }
+    });
+
+    sourceArticles.totalFound = sourceArticles.articles.length;
+    res.json(sourceArticles);
+    
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error fetching source news' });
+  }
+});
+
+// ENDPOINT 5: Search all today's news by keyword (e.g., /api/news/search?q=bitcoin)
+app.get('/api/news/search', async (req, res) => {
+  try {
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ error: 'Please provide a search query (e.g., ?q=apple)' });
+
+    const searchKeyword = query.toLowerCase();
+    const today = new Date().toLocaleDateString('en-CA');
+    const allRecords = await NewsRecord.find({ date: today });
+
+    const searchResults = [];
+
+    // Loop through everything to find matching text
+    allRecords.forEach(record => {
+      Object.entries(record.data).forEach(([siteKey, siteData]) => {
+        siteData.all.forEach(article => {
+          const headline = article.h ? article.h.toLowerCase() : '';
+          const desc = article.d ? article.d.toLowerCase() : '';
+
+          if (headline.includes(searchKeyword) || desc.includes(searchKeyword)) {
+            searchResults.push({
+              ...article,
+              source: siteKey,
+              category: record.category
+            });
+          }
+        });
+      });
+    });
+
+    res.json({ query: query, totalResults: searchResults.length, results: searchResults });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error searching news' });
+  }
+});
+
+// ENDPOINT 6: Get top featured articles (Must have Image + Description)
+app.get('/api/news/featured', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 10; // Default to 10 articles
+    const today = new Date().toLocaleDateString('en-CA');
+    
+    // Just grab 'general' news for the main hero section to keep it broad
+    const record = await NewsRecord.findOne({ date: today, category: 'general' });
+
+    if (!record) return res.status(404).json({ error: 'No data found' });
+
+    let premiumArticles = [];
+
+    Object.entries(record.data).forEach(([siteKey, siteData]) => {
+      // Your scraper already sorted these beautifully into 'descImg'!
+      if (siteData.descImg && siteData.descImg.length > 0) {
+        // Take the top 2 premium articles from each source
+        const topFromSource = siteData.descImg.slice(0, 2).map(art => ({ ...art, source: siteKey }));
+        premiumArticles.push(...topFromSource);
+      }
+    });
+
+    // Shuffle the array so it's a mix of sources, then slice it to the requested limit
+    premiumArticles = premiumArticles.sort(() => 0.5 - Math.random()).slice(0, limit);
+
+    res.json(premiumArticles);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Error fetching featured news' });
+  }
+});
+
 // Start the server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
