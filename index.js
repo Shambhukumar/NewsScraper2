@@ -1,31 +1,44 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const mongoose = require('mongoose');
+const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Middleware to parse JSON bodies (Crucial for the /api/ai/ask route)
+app.use(express.json());
+
+// Initialize Gemini AI
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
 // === MONGODB SETUP ===
-// Replace with your actual MongoDB connection string from MongoDB Atlas
-const MONGO_URI = process.env.MONGO_URI || 'database uri';
+const MONGO_URI = process.env.MONGO_URI;
 
 mongoose.connect(MONGO_URI)
   .then(() => console.log('🟢 Connected to MongoDB'))
   .catch((err) => console.error('🔴 MongoDB Connection Error:', err));
 
-// Define how the data looks in the database
+// 1. Schema for the Scraped News
 const newsSchema = new mongoose.Schema({
-  date: String,      // Will store as 'YYYY-MM-DD'
-  category: String,  // 'general', 'business', etc.
-  data: mongoose.Schema.Types.Mixed // Allows us to store your massive nested JSON object
+  date: String,      
+  category: String,  
+  data: mongoose.Schema.Types.Mixed 
 });
-
 const NewsRecord = mongoose.model('NewsRecord', newsSchema);
+
+// 2. Schema for the AI Cache (Survives Render restarts)
+const cacheSchema = new mongoose.Schema({
+  date: String,
+  cacheName: String,
+  expiresAt: Date
+});
+const AiCache = mongoose.model('AiCache', cacheSchema);
 
 
 // === SCRAPER LOGIC ===
-// 1. Fetch and clean the HTML
 async function getCleanedHTML(url) {
   try {
     console.log(`🚀 Fetching: ${url}`);
@@ -68,7 +81,6 @@ async function getCleanedHTML(url) {
   }
 }
 
-// 2. Extract structured data
 function extractNewsData(rawHtml) {
   const $ = cheerio.load(rawHtml);
   const allData = {};
@@ -269,8 +281,6 @@ function extractNewsData(rawHtml) {
   return allData; 
 }
 
-
-// 3. THE CATEGORIES DICTIONARY
 const CATEGORIES = {
   general: [
     'https://www.nytimes.com/',
@@ -298,7 +308,7 @@ const CATEGORIES = {
     'https://www.aljazeera.com/middle-east/',
     'https://www.bbc.com/news/world/middle_east',
     'https://www.nbcnews.com/news/mideast'
-]
+  ]
 };
 
 async function compileAllNews(urlsToScrape) {
@@ -313,28 +323,50 @@ async function compileAllNews(urlsToScrape) {
 }
 
 
+// === AI MINIFIER FUNCTION ===
+// Converts massive JSON into flat, token-efficient text for Gemini
+function minifyNewsForAI(allRecords) {
+  let aiText = "DAILY NEWS CONTEXT:\n\n";
+
+  allRecords.forEach(record => {
+    const category = record.category;
+    if (!record.data) return;
+
+    Object.entries(record.data).forEach(([siteKey, siteData]) => {
+      if (siteData.all && siteData.all.length > 0) {
+        siteData.all.forEach(article => {
+          const headline = article.h || '';
+          const desc = article.d || '';
+          if (headline) {
+            aiText += `[${siteKey}] (${category}) ${headline} - ${desc}\n`;
+          }
+        });
+      }
+    });
+  });
+
+  return aiText;
+}
+
+
 // === ENDPOINTS ===
 
-// ENDPOINT 1: THE SCRAPER SYNC (Hit this to trigger the database update)
+// 1. Sync Scraper Endpoint
 app.get('/api/sync-database', async (req, res) => {
   try {
-    // Generate a clean 'YYYY-MM-DD' string based on today's local date
     const today = new Date().toLocaleDateString('en-CA'); 
-
     console.log(`\n🔄 Starting full database sync for ${today}...`);
 
-    // Loop through the categories ONE BY ONE to protect Render RAM limits
     for (const [categoryName, urls] of Object.entries(CATEGORIES)) {
       console.log(`\n📂 Scraping category: ${categoryName.toUpperCase()}`);
       
       const rawCompiledHTML = await compileAllNews(urls);
       const structuredNewsData = extractNewsData(rawCompiledHTML);
 
-      // THE UPSERT COMMAND: Find today's date + category. If it exists, overwrite it. If not, create it.
       await NewsRecord.findOneAndUpdate(
-        { date: today, category: categoryName },  // Search criteria
-        { data: structuredNewsData },             // Data to update
-        { upsert: true, new: true }               // Options (upsert = insert if not found)
+        { date: today, category: categoryName }, 
+        { data: structuredNewsData },            
+        { upsert: true, new: true }              
       );
 
       console.log(`✅ Saved ${categoryName} data to MongoDB!`);
@@ -348,83 +380,56 @@ app.get('/api/sync-database', async (req, res) => {
   }
 });
 
-
-// ENDPOINT 2: THE FRONTEND API (Instant responses reading from the DB)
+// 2. Fetch specific category
 app.get('/api/news', async (req, res) => {
   try {
     const requestedCategory = req.query.category || 'general';
     const today = new Date().toLocaleDateString('en-CA');
-
-    // Instantly query the database instead of running the scraper
     const newsItem = await NewsRecord.findOne({ date: today, category: requestedCategory });
 
-    if (newsItem) {
-      // Send the saved data directly to React
-      return res.json(newsItem.data);
-    } else {
-      // If the DB is empty for today, tell the user to run the sync
-      return res.status(404).json({ 
-        error: `No data found for '${requestedCategory}' today. Please hit /api/sync-database first to populate the database.` 
-      });
-    }
-
+    if (newsItem) return res.json(newsItem.data);
+    return res.status(404).json({ error: `No data found. Hit /api/sync-database first.` });
   } catch (error) {
-    console.error('API Error:', error);
-    res.status(500).json({ error: 'Error fetching news from database' });
+    res.status(500).json({ error: 'Error fetching news' });
   }
 });
 
-// ENDPOINT 3: Get ALL news across ALL categories for today
+// 3. Fetch all categories
 app.get('/api/news/all', async (req, res) => {
   try {
     const today = new Date().toLocaleDateString('en-CA');
     const allRecords = await NewsRecord.find({ date: today });
 
     if (!allRecords || allRecords.length === 0) {
-      return res.status(404).json({ error: 'No data found for today. Run /api/sync-database first.' });
+      return res.status(404).json({ error: 'No data found. Run /api/sync-database first.' });
     }
 
-    // Format the response so the frontend can easily map over it
     const combinedData = {};
-    allRecords.forEach(record => {
-      combinedData[record.category] = record.data;
-    });
-
+    allRecords.forEach(record => { combinedData[record.category] = record.data; });
     res.json(combinedData);
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Error fetching all news' });
   }
 });
 
-// ENDPOINT 4: Get news by specific source (e.g., /api/news/source/NYT)
+// 4. Fetch by source (Fixed Case-Sensitivity)
 app.get('/api/news/source/:siteKey', async (req, res) => {
   try {
-    // Keep this for the response, but we'll use a safer check for the data
     const requestedSite = req.params.siteKey.toUpperCase(); 
     const today = new Date().toLocaleDateString('en-CA');
-    
     const allRecords = await NewsRecord.find({ date: today });
-
-    // Quick debug: If this logs 0, your date string is the problem!
-    console.log(`Found ${allRecords.length} records for date: ${today}`);
 
     let sourceArticles = { site: requestedSite, totalFound: 0, articles: [] };
 
     allRecords.forEach(record => {
       const categoryData = record.data;
-      
       if (categoryData) {
-        // 1. Find the actual key in the object, ignoring case
         const actualKey = Object.keys(categoryData).find(
           key => key.toUpperCase() === requestedSite || key.toUpperCase().includes(requestedSite)
         );
 
-        // 2. If we found a matching key, grab the data using THAT key
         if (actualKey && categoryData[actualKey] && categoryData[actualKey].all) {
-          const articles = categoryData[actualKey].all;
-          
-          articles.forEach(article => {
+          categoryData[actualKey].all.forEach(article => {
             sourceArticles.articles.push({ ...article, category: record.category });
           });
         }
@@ -433,38 +438,29 @@ app.get('/api/news/source/:siteKey', async (req, res) => {
 
     sourceArticles.totalFound = sourceArticles.articles.length;
     res.json(sourceArticles);
-    
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Error fetching source news' });
   }
 });
 
-// ENDPOINT 5: Search all today's news by keyword (e.g., /api/news/search?q=bitcoin)
+// 5. Search API
 app.get('/api/news/search', async (req, res) => {
   try {
     const query = req.query.q;
-    if (!query) return res.status(400).json({ error: 'Please provide a search query (e.g., ?q=apple)' });
+    if (!query) return res.status(400).json({ error: 'Please provide a search query (?q=apple)' });
 
     const searchKeyword = query.toLowerCase();
     const today = new Date().toLocaleDateString('en-CA');
     const allRecords = await NewsRecord.find({ date: today });
-
     const searchResults = [];
 
-    // Loop through everything to find matching text
     allRecords.forEach(record => {
       Object.entries(record.data).forEach(([siteKey, siteData]) => {
         siteData.all.forEach(article => {
           const headline = article.h ? article.h.toLowerCase() : '';
           const desc = article.d ? article.d.toLowerCase() : '';
-
           if (headline.includes(searchKeyword) || desc.includes(searchKeyword)) {
-            searchResults.push({
-              ...article,
-              source: siteKey,
-              category: record.category
-            });
+            searchResults.push({ ...article, source: siteKey, category: record.category });
           }
         });
       });
@@ -472,44 +468,205 @@ app.get('/api/news/search', async (req, res) => {
 
     res.json({ query: query, totalResults: searchResults.length, results: searchResults });
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Error searching news' });
   }
 });
 
-// ENDPOINT 6: Get top featured articles (Must have Image + Description)
+// 6. Featured API
 app.get('/api/news/featured', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 10; // Default to 10 articles
+    const limit = parseInt(req.query.limit) || 10;
     const today = new Date().toLocaleDateString('en-CA');
-    
-    // Just grab 'general' news for the main hero section to keep it broad
     const record = await NewsRecord.findOne({ date: today, category: 'general' });
 
     if (!record) return res.status(404).json({ error: 'No data found' });
 
     let premiumArticles = [];
-
     Object.entries(record.data).forEach(([siteKey, siteData]) => {
-      // Your scraper already sorted these beautifully into 'descImg'!
       if (siteData.descImg && siteData.descImg.length > 0) {
-        // Take the top 2 premium articles from each source
         const topFromSource = siteData.descImg.slice(0, 2).map(art => ({ ...art, source: siteKey }));
         premiumArticles.push(...topFromSource);
       }
     });
 
-    // Shuffle the array so it's a mix of sources, then slice it to the requested limit
     premiumArticles = premiumArticles.sort(() => 0.5 - Math.random()).slice(0, limit);
-
     res.json(premiumArticles);
   } catch (error) {
-    console.error(error);
     res.status(500).json({ error: 'Error fetching featured news' });
   }
 });
 
-// Start the server
+
+// === NEW AI ENDPOINTS ===
+
+// AI Endpoint 1: Create the Cache (Run this via Cron job every 6-8 hours)
+// AI ENDPOINT 1: Create the Cache
+// app.get('/api/ai/update-cache', async (req, res) => {
+//   try {
+//     const today = new Date().toLocaleDateString('en-CA');
+//     console.log(`\n🧠 Building AI Cache for ${today}...`);
+
+//     const allRecords = await NewsRecord.find({ date: today });
+//     if (!allRecords || allRecords.length === 0) {
+//       return res.status(404).json({ error: 'No news in DB. Run /api/sync-database first.' });
+//     }
+
+//     const minifiedText = minifyNewsForAI(allRecords);
+    
+//     // Create the cache using the newest supported 2.0 model
+//     const cache = await ai.caches.create({
+//       model: 'gemini-2.0-flash', 
+//       config: {
+//         contents: [{ role: 'user', parts: [{ text: minifiedText }] }],
+//         ttl: '28800s', // Lives for 8 hours
+//       }
+//     });
+
+//     console.log(`✅ Cache created successfully: ${cache.name}`);
+
+//     // Save cache details to MongoDB
+//     await AiCache.findOneAndUpdate(
+//       { date: today },
+//       { cacheName: cache.name, expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) },
+//       { upsert: true, new: true }
+//     );
+
+//     res.json({ success: true, cacheName: cache.name });
+//   } catch (error) {
+//     console.error('Cache Creation Error:', error);
+//     res.status(500).json({ error: error.message });
+//   }
+// });
+
+// // AI Endpoint 2: The Chat Interface for the Frontend
+// app.post('/api/ai/ask', async (req, res) => {
+//   try {
+//     const { question } = req.body;
+//     if (!question) return res.status(400).json({ error: 'Please provide a question.' });
+
+//     const today = new Date().toLocaleDateString('en-CA');
+//     const activeCache = await AiCache.findOne({ date: today });
+
+//     if (!activeCache || !activeCache.cacheName) {
+//       return res.status(503).json({ error: 'AI is updating its news knowledge. Please try again in a moment!' });
+//     }
+
+//     // Pass the question and the cacheName to Gemini
+//     const response = await ai.models.generateContent({
+//       model: 'gemini-1.5-flash',
+//       contents: question,
+//       config: {
+//         cachedContent: activeCache.cacheName,
+//         systemInstruction: "You are an expert news assistant. Answer the user's question clearly and concisely using ONLY the provided cached news data. If the answer cannot be found in the provided data, politely inform them that you do not have that information in today's news cycle."
+//       }
+//     });
+
+//     res.json({ answer: response.text });
+//   } catch (error) {
+//     console.error('AI Chat Error:', error);
+//     res.status(500).json({ error: 'Error generating AI response.' });
+//   }
+// });
+
+// AI ENDPOINT: The Direct Chat Interface (No Caching Required)
+app.post('/api/ai/ask', async (req, res) => {
+  try {
+    const { question } = req.body;
+    if (!question) return res.status(400).json({ error: 'Please provide a question.' });
+
+    const today = new Date().toLocaleDateString('en-CA');
+    
+    // 1. Grab today's news directly from the database
+    const allRecords = await NewsRecord.find({ date: today });
+
+    if (!allRecords || allRecords.length === 0) {
+      return res.status(503).json({ error: 'The news database is currently empty for today. Please run the sync first!' });
+    }
+
+    // 2. Minify the data on the fly 
+    const minifiedText = minifyNewsForAI(allRecords);
+
+    // 3. Send the minified text and the question directly to Gemini
+    // We use 1.5-flash here because it gives you 1,500 free requests per day!
+   const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-lite-preview', // <-- Updated to the newest, recognized model!
+      contents: `Here is today's compiled news data: \n\n${minifiedText}\n\nUser Question: ${question}`,
+      config: {
+        systemInstruction: "You are an expert news assistant. Answer the user's question clearly and concisely using ONLY the provided news data. If the answer cannot be found in the provided data, politely inform them that you do not have that information in today's news cycle."
+      }
+    });
+
+    res.json({ answer: response.text });
+
+  } catch (error) {
+    console.error('AI Chat Error:', error);
+    res.status(500).json({ error: 'Error generating AI response.' });
+  }
+});
+
+// AI ENDPOINT 1: Create the Cache (Pure In-Memory File Upload)
+app.get('/api/ai/update-cache', async (req, res) => {
+  try {
+    const today = new Date().toLocaleDateString('en-CA');
+    console.log(`\n🧠 Building AI Cache for ${today}...`);
+
+    const allRecords = await NewsRecord.find({ date: today });
+    if (!allRecords || allRecords.length === 0) {
+      return res.status(404).json({ error: 'No news in DB. Run /api/sync-database first.' });
+    }
+
+    const minifiedText = minifyNewsForAI(allRecords);
+    
+    // 1. Create a "Virtual File" in memory!
+    const virtualFile = new Blob([minifiedText], { type: 'text/plain' });
+    console.log('📄 Virtual file created in memory. Uploading to Google...');
+
+    // 2. Upload the virtual file directly to Gemini
+    const doc = await ai.files.upload({
+      file: virtualFile, 
+      config: { mimeType: "text/plain", displayName: `News_${today}` },
+    });
+    console.log(`☁️ Uploaded file: ${doc.name} (${doc.uri})`);
+
+    // 3. Create the Cache using standard JSON format!
+    const cache = await ai.caches.create({
+      model: 'gemini-3-flash-preview', 
+      config: {
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                fileData: {
+                  fileUri: doc.uri,
+                  mimeType: doc.mimeType,
+                },
+              },
+            ],
+          },
+        ],
+        systemInstruction: "You are an expert news assistant. Answer the user's question clearly and concisely using ONLY the provided news data. If the answer cannot be found, politely inform them that you do not have that information.",
+        ttl: '28800s', // 8 hours
+      }
+    });
+
+    console.log(`✅ Cache created successfully: ${cache.name}`);
+
+    // 4. Save cache details to MongoDB
+    await AiCache.findOneAndUpdate(
+      { date: today },
+      { cacheName: cache.name, expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) },
+      { upsert: true, new: true }
+    );
+
+    res.json({ success: true, cacheName: cache.name });
+
+  } catch (error) {
+    console.error('Cache Creation Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+// Start Server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
