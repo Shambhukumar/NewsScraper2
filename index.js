@@ -8,6 +8,10 @@ const { GoogleGenAI } = require('@google/genai');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// === MIDDLEWARE ===
+// 2. Enable CORS for all routes
+app.use(cors());
+
 // Middleware to parse JSON bodies (Crucial for the /api/ai/ask route)
 app.use(express.json());
 
@@ -604,68 +608,7 @@ app.post('/api/ai/ask', async (req, res) => {
   }
 });
 
-// AI ENDPOINT 1: Create the Cache (Pure In-Memory File Upload)
-app.get('/api/ai/update-cache', async (req, res) => {
-  try {
-    const today = new Date().toLocaleDateString('en-CA');
-    console.log(`\n🧠 Building AI Cache for ${today}...`);
 
-    const allRecords = await NewsRecord.find({ date: today });
-    if (!allRecords || allRecords.length === 0) {
-      return res.status(404).json({ error: 'No news in DB. Run /api/sync-database first.' });
-    }
-
-    const minifiedText = minifyNewsForAI(allRecords);
-    
-    // 1. Create a "Virtual File" in memory!
-    const virtualFile = new Blob([minifiedText], { type: 'text/plain' });
-    console.log('📄 Virtual file created in memory. Uploading to Google...');
-
-    // 2. Upload the virtual file directly to Gemini
-    const doc = await ai.files.upload({
-      file: virtualFile, 
-      config: { mimeType: "text/plain", displayName: `News_${today}` },
-    });
-    console.log(`☁️ Uploaded file: ${doc.name} (${doc.uri})`);
-
-    // 3. Create the Cache using standard JSON format!
-    const cache = await ai.caches.create({
-      model: 'gemini-3-flash-preview', 
-      config: {
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                fileData: {
-                  fileUri: doc.uri,
-                  mimeType: doc.mimeType,
-                },
-              },
-            ],
-          },
-        ],
-        systemInstruction: "You are an expert news assistant. Answer the user's question clearly and concisely using ONLY the provided news data. If the answer cannot be found, politely inform them that you do not have that information.",
-        ttl: '28800s', // 8 hours
-      }
-    });
-
-    console.log(`✅ Cache created successfully: ${cache.name}`);
-
-    // 4. Save cache details to MongoDB
-    await AiCache.findOneAndUpdate(
-      { date: today },
-      { cacheName: cache.name, expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) },
-      { upsert: true, new: true }
-    );
-
-    res.json({ success: true, cacheName: cache.name });
-
-  } catch (error) {
-    console.error('Cache Creation Error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
 // Start Server
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);

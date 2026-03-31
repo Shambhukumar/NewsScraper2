@@ -1,6 +1,7 @@
 # Dependency directories
 node_modules/
 temp.js
+sample.html
 
 # Logs
 logs
