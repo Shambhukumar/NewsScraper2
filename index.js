@@ -359,7 +359,7 @@ function minifyNewsForAI(allRecords) {
 // 1. Sync Scraper Endpoint
 app.get('/api/sync-database', async (req, res) => {
   try {
-    const today = new Date().toLocaleDateString('en-CA'); 
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     console.log(`\n🔄 Starting full database sync for ${today}...`);
 
     for (const [categoryName, urls] of Object.entries(CATEGORIES)) {
@@ -368,9 +368,33 @@ app.get('/api/sync-database', async (req, res) => {
       const rawCompiledHTML = await compileAllNews(urls);
       const structuredNewsData = extractNewsData(rawCompiledHTML);
 
+      // --- THE FIX ---
+      // 1. Fetch the existing record for today (if it exists)
+      const existingRecord = await NewsRecord.findOne({ date: today, category: categoryName });
+      
+      // 2. Start with the existing data (or an empty object if it's the first run of the day)
+      let mergedData = existingRecord && existingRecord.data ? existingRecord.data : {};
+
+      // 3. Loop through the freshly scraped data
+      for (const [siteKey, siteData] of Object.entries(structuredNewsData)) {
+        // Only overwrite the existing data IF the scraper actually found articles this time
+        if (siteData && siteData.all && siteData.all.length > 0) {
+          mergedData[siteKey] = siteData;
+          console.log(`   ➔ [+] Updated ${siteKey} (${siteData.all.length} articles)`);
+        } else {
+          // If scrape failed but we have old data, keep old data. 
+          // If we don't have old data, initialize the empty structure.
+          if (!mergedData[siteKey]) {
+            mergedData[siteKey] = siteData;
+          }
+          console.log(`   ➔ [-] Skipped updating ${siteKey} (Fetch failed or no new articles)`);
+        }
+      }
+
+      // 4. Save the merged data back to MongoDB
       await NewsRecord.findOneAndUpdate(
         { date: today, category: categoryName }, 
-        { data: structuredNewsData },            
+        { data: mergedData },            
         { upsert: true, new: true }              
       );
 
@@ -579,7 +603,7 @@ app.post('/api/ai/ask', async (req, res) => {
     const { question } = req.body;
     if (!question) return res.status(400).json({ error: 'Please provide a question.' });
 
-    const today = new Date().toLocaleDateString('en-CA');
+    const today = new Date().toLocaleDateString('');
     
     // 1. Grab today's news directly from the database
     const allRecords = await NewsRecord.find({ date: today });
